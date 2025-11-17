@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>WebSocket Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        #messages {
+            height: 300px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            margin-bottom: 10px;
+            overflow-y: auto;
+        }
+        #message {
+            width: 80%;
+            padding: 8px;
+        }
+        button {
+            padding: 8px 15px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+    </style>
+</head>
+<body>
+    <h1>WebSocket Test</h1>
+    <div id="messages"></div>
+    <div>
+        <input type="text" id="message" placeholder="Type your message">
+        <button onclick="sendMessage()">Send</button>
+    </div>
+
+    <script>
+        // Connect to WebSocket
+        const socket = new WebSocket('ws://' + window.location.host + '/ws/hat/');
+        
+        // Connection opened
+        socket.onopen = function(e) {
+            logMessage('Connected to WebSocket server');
+        };
+
+        // Listen for messages
+        socket.onmessage = function(e) {
+            const data = JSON.parse(e.data);
+            logMessage('Received: ' + data.message);
+        };
+
+        // Connection closed
+        socket.onclose = function(e) {
+            logMessage('Disconnected from WebSocket server');
+        };
+
+        // Error handling
+        socket.onerror = function(error) {
+            logMessage('WebSocket Error: ' + error.message);
+        };
+
+        // Send message function
+        function sendMessage() {
+            const input = document.getElementById('message');
+            const message = input.value.trim();
+            
+            if (message) {
+                socket.send(JSON.stringify({
+                    'message': message
+                }));
+                logMessage('Sent: ' + message);
+                input.value = '';
+            }
+        }
+
+        // Helper function to log messages to the UI
+        function logMessage(message) {
+            const messagesDiv = document.getElementById('messages');
+            const messageElement = document.createElement('div');
+            messageElement.textContent = message;
+            messagesDiv.appendChild(messageElement);
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // Allow sending message with Enter key
+        document.getElementById('message').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+    </script>
+</body>
+</html>
