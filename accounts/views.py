@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import jwt
 from django.conf import settings
@@ -11,8 +12,9 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from .db import USERS_COLLECTION
-from voice_common_names import VOICE_COMMON_NAMES
 from api.tts_service import tts_service
+from storage import r2_client
+from voice_common_names import VOICE_COMMON_NAMES
 
 
 def _json_error(message, status=400, **extra):
@@ -112,6 +114,7 @@ def signin(request):
         return _json_error("Invalid credentials.", status=401)
 
     token = _generate_token(user)
+    user_voice = user.get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
     return JsonResponse(
         {
             "message": "Signin successful",
@@ -120,7 +123,8 @@ def signin(request):
                 "first_name": user.get("first_name"),
                 "last_name": user.get("last_name"),
                 "email": user.get("email"),
-                "voice": user.get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium"),
+                "voice": user_voice,
+                "voice_common_name": VOICE_COMMON_NAMES.get(user_voice, user_voice),
             },
         }
     )
@@ -129,6 +133,7 @@ def signin(request):
 VOICE_SAMPLE_TEXT = (
     "Hi, I am your Hear Helper Assistant. I am all excited to know about your favorite books."
 )
+SAMPLE_CACHE_DIR = settings.BASE_DIR / "voice_samples"
 
 
 def available_models(request):
@@ -142,7 +147,7 @@ def available_models(request):
     voices = tts_service.available_voices()
     models = []
     for voice_id in voices:
-        sample = _generate_voice_sample(voice_id)
+        sample = _load_or_generate_voice_sample(voice_id)
         entry = {"id": voice_id, "common_name": VOICE_COMMON_NAMES.get(voice_id, voice_id)}
         if sample:
             entry["sample"] = sample
@@ -184,7 +189,41 @@ def update_voice(request):
     if result.matched_count == 0:
         return _json_error("User not found.", status=404)
 
-    return JsonResponse({"message": "Voice updated.", "voice": voice})
+    return JsonResponse({
+        "message": "Voice updated.",
+        "voice": voice,
+        "voice_common_name": VOICE_COMMON_NAMES.get(voice, voice),
+    })
+
+
+def _load_or_generate_voice_sample(voice_id: str):
+    remote_key = f"voice_samples/{voice_id}.json"
+    if r2_client.is_enabled():
+        data = r2_client.download_bytes(remote_key)
+        if data:
+            try:
+                return json.loads(data.decode("utf-8"))
+            except json.JSONDecodeError:
+                pass
+
+    cache_path = SAMPLE_CACHE_DIR / f"{voice_id}.json"
+    if cache_path.exists() and not r2_client.is_enabled():
+        try:
+            return json.loads(cache_path.read_text())
+        except json.JSONDecodeError:
+            cache_path.unlink(missing_ok=True)
+
+    sample = _generate_voice_sample(voice_id)
+    if not sample:
+        return None
+
+    if r2_client.is_enabled():
+        r2_client.upload_bytes(json.dumps(sample).encode("utf-8"), remote_key)
+    else:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(sample), encoding="utf-8")
+
+    return sample
 
 
 def _generate_voice_sample(voice_id: str):

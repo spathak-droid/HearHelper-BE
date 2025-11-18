@@ -11,6 +11,8 @@ from typing import Any, Dict, Optional, Tuple
 
 from gtts import gTTS
 
+from storage import r2_client
+
 try:
     from pydub import AudioSegment
 except ImportError:
@@ -105,6 +107,7 @@ class TTSService:
         self.piper_enabled = PIPER_AVAILABLE
         self.gtts_lang = os.getenv("GTTS_LANG", "en")
         self._gtts_format = "mp3"
+        self.remote_models: set[str] = set()
 
         if self.piper_enabled:
             self._discover_models()
@@ -194,7 +197,9 @@ class TTSService:
         """Return the list of discovered voice ids."""
         if not self.piper_enabled:
             return tuple()
-        return tuple(sorted(self.models.keys()))
+        voice_ids = set(self.remote_models)
+        voice_ids.update(self.models.keys())
+        return tuple(sorted(voice_ids))
 
     async def _synthesize_with_gtts_async(
         self,
@@ -339,6 +344,7 @@ class TTSService:
             ", ".join(sorted(self.models.keys())),
             self.default_voice_id,
         )
+        self._refresh_remote_models()
 
     def _select_model(
         self,
@@ -352,6 +358,9 @@ class TTSService:
 
         if target_id:
             model = self.models.get(target_id)
+            if model is None and self._download_voice_assets(target_id):
+                self._discover_models()
+                model = self.models.get(target_id)
             if model is None:
                 logger.warning(
                     "Requested Piper voice '%s' not found. Using default voice.",
@@ -392,6 +401,28 @@ class TTSService:
                 model_id,
             )
             return None
+
+    def _refresh_remote_models(self) -> None:
+        if not r2_client.is_enabled():
+            return
+        keys = r2_client.list_objects("piper_models/")
+        remote_ids = set()
+        for key in keys:
+            if key.endswith(".onnx"):
+                remote_ids.add(Path(key).stem)
+        self.remote_models = remote_ids
+
+    def _download_voice_assets(self, voice_id: str) -> bool:
+        if not r2_client.is_enabled():
+            return False
+        model_path = self.models_dir / f"{voice_id}.onnx"
+        config_path = Path(f"{model_path}.json")
+        downloaded = False
+        if not model_path.exists():
+            downloaded |= r2_client.download_file(f"piper_models/{model_path.name}", model_path)
+        if not config_path.exists():
+            downloaded |= r2_client.download_file(f"piper_models/{config_path.name}", config_path)
+        return model_path.exists() and config_path.exists()
 
 
 # Create a singleton instance

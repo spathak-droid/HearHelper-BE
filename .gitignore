@@ -60,6 +60,7 @@ piper_models/
 # Generated audio/book content
 generated_audio/
 public_domain_books/
+voice_samples/
 
 # Additional local environments
 piper-env/

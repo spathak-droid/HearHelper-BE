@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .book_sources import BookSourceManager
 from .tts_service import tts_service
+from storage import r2_client
 
 logger = logging.getLogger(__name__)
 
@@ -113,6 +114,7 @@ class BookConverter:
         self.output_root = Path(output_root) if output_root else OUTPUT_DIR
         self.chunk_chars = chunk_chars
         self.book_sources = BookSourceManager(self.books_dir)
+        self.remote_enabled = r2_client.is_enabled()
 
         self.books_dir.mkdir(parents=True, exist_ok=True)
         self.output_root.mkdir(parents=True, exist_ok=True)
@@ -123,17 +125,34 @@ class BookConverter:
             for book_path in self.books_dir.glob("*.txt")
             if book_path.is_file()
         }
+        remote_books = set()
+        if self.remote_enabled:
+            for key in r2_client.list_objects("public_domain_books/"):
+                if key.endswith(".txt"):
+                    remote_books.add(Path(key).stem)
         suggested = {suggestion.book_id for suggestion in self.book_sources.suggestions()}
-        combined = sorted(existing | suggested)
+        combined = sorted(existing | suggested | remote_books)
         return tuple(combined)
 
     def load_book_text(self, book_id: str) -> str:
+        remote_key = f"public_domain_books/{book_id}.txt"
+        if self.remote_enabled:
+            data = r2_client.download_bytes(remote_key)
+            if data:
+                return data.decode("utf-8")
+
         path = self.ensure_book_file(book_id)
         if not path:
             raise FileNotFoundError(
                 f"Book '{book_id}' was not found locally and no download source is configured."
             )
-        return path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8")
+
+        if self.remote_enabled:
+            r2_client.upload_bytes(text.encode("utf-8"), remote_key)
+            path.unlink(missing_ok=True)
+
+        return text
 
     def build_chunks(self, text: str) -> List[str]:
         paragraphs = list(_paragraphs_from_text(text))
@@ -158,16 +177,21 @@ class BookConverter:
             )
 
         audio_files = []
-        for chunk in manifest["chunks"]:
-            file_name = chunk.get("file")
-            if file_name:
-                audio_files.append(self._chunk_file_path(book_id, file_name, voice_id))
+        if not self.remote_enabled:
+            for chunk in manifest["chunks"]:
+                file_name = chunk.get("file")
+                if file_name:
+                    audio_files.append(self._chunk_file_path(book_id, file_name, voice_id))
 
         return ConversionResult(
             book_id=book_id,
             used_voice=manifest.get("voice"),
             audio_files=audio_files,
-            manifest_path=self._manifest_path(book_id, voice_id),
+            manifest_path=(
+                self._manifest_path(book_id, voice_id)
+                if not self.remote_enabled
+                else Path(self._manifest_remote_key(book_id, voice_id))
+            ),
         )
 
     async def get_chunk_audio(
@@ -189,9 +213,17 @@ class BookConverter:
         )
 
         chunk_entry = manifest["chunks"][chunk_index]
-        file_path = self._chunk_file_path(book_id, chunk_entry["file"], voice_id)
-        audio_bytes = file_path.read_bytes()
-        audio_format = manifest.get("format") or file_path.suffix.lstrip(".") or DEFAULT_AUDIO_FORMAT
+        filename = chunk_entry["file"]
+        if self.remote_enabled:
+            audio_bytes = r2_client.download_bytes(self._chunk_remote_key(book_id, voice_id, filename))
+            if not audio_bytes:
+                raise FileNotFoundError(f"Chunk {filename} missing from remote storage")
+            audio_format = manifest.get("format") or Path(filename).suffix.lstrip(".") or DEFAULT_AUDIO_FORMAT
+        else:
+            file_path = self._chunk_file_path(book_id, filename, voice_id)
+            audio_bytes = file_path.read_bytes()
+            audio_format = manifest.get("format") or file_path.suffix.lstrip(".") or DEFAULT_AUDIO_FORMAT
+            file_path.unlink(missing_ok=True)
         chunk_text = chunk_entry.get("text", "")
         total_chunks = manifest.get("chunk_count") or len(manifest["chunks"])
         return audio_bytes, audio_format, manifest.get("voice"), total_chunks, chunk_text
@@ -204,12 +236,17 @@ class BookConverter:
         preferred_format: str = DEFAULT_AUDIO_FORMAT,
     ) -> None:
         try:
-            await self.ensure_chunk_generated(
+            manifest = await self.ensure_chunk_generated(
                 book_id,
                 chunk_index,
                 voice_id=voice_id,
                 preferred_format=preferred_format,
             )
+            if self.remote_enabled:
+                chunk_entry = manifest["chunks"][chunk_index]
+                if chunk_entry.get("file"):
+                    path = self._chunk_file_path(book_id, chunk_entry["file"], voice_id)
+                    path.unlink(missing_ok=True)
         except Exception as exc:  # pragma: no cover - best-effort cache warming
             logger.debug("Prefetch for %s chunk %s skipped: %s", book_id, chunk_index, exc)
 
@@ -229,9 +266,12 @@ class BookConverter:
 
         chunk_entry = chunks[chunk_index]
         file_name = chunk_entry.get("file")
-        if file_name:
+        if file_name and not self.remote_enabled:
             file_path = self._chunk_file_path(book_id, file_name, voice_id)
             if file_path.exists():
+                return manifest
+        if file_name and self.remote_enabled:
+            if r2_client.object_exists(self._chunk_remote_key(book_id, voice_id, file_name)):
                 return manifest
 
         text = chunk_entry.get("text", "")
@@ -245,8 +285,12 @@ class BookConverter:
             raise RuntimeError(f"TTS error on chunk {chunk_index + 1}: {error}")
 
         filename = chunk_entry.get("file") or f"{book_id}_part_{chunk_index + 1:03d}.{audio_format}"
-        file_path = self._chunk_file_path(book_id, filename, voice_id)
-        file_path.write_bytes(audio_data)
+        if self.remote_enabled:
+            r2_client.upload_bytes(audio_data, self._chunk_remote_key(book_id, voice_id, filename))
+        else:
+            file_path = self._chunk_file_path(book_id, filename, voice_id)
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            file_path.write_bytes(audio_data)
 
         chunk_entry["file"] = filename
         chunk_entry["generated"] = True
@@ -317,6 +361,25 @@ class BookConverter:
         return manifest
 
     def _load_manifest(self, book_id: str, voice_id: Optional[str]) -> Optional[Dict[str, object]]:
+        if self.remote_enabled:
+            remote_key = self._manifest_remote_key(book_id, voice_id)
+            data = r2_client.download_bytes(remote_key)
+            if data:
+                try:
+                    return json.loads(data.decode("utf-8"))
+                except json.JSONDecodeError:
+                    pass
+            legacy_path = self._legacy_manifest_path(book_id)
+            if legacy_path.exists():
+                try:
+                    manifest = json.loads(legacy_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    legacy_path.unlink(missing_ok=True)
+                    return None
+                self._migrate_legacy_manifest(book_id, manifest, voice_id)
+                return manifest
+            return None
+
         manifest_path = self._manifest_path(book_id, voice_id)
         if not manifest_path.exists():
             legacy_path = self._legacy_manifest_path(book_id)
@@ -340,9 +403,13 @@ class BookConverter:
     def _save_manifest(self, manifest: Dict[str, object]) -> None:
         voice_ns = manifest.get("voice_key") or self._voice_namespace(manifest.get("voice"))
         manifest["voice_key"] = voice_ns
-        manifest_path = self._manifest_path(manifest["book_id"], voice_ns)
-        manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        serialized = json.dumps(manifest, indent=2)
+        if self.remote_enabled:
+            r2_client.upload_bytes(serialized.encode("utf-8"), self._manifest_remote_key(manifest["book_id"], voice_ns))
+        else:
+            manifest_path = self._manifest_path(manifest["book_id"], voice_ns)
+            manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            manifest_path.write_text(serialized, encoding="utf-8")
 
     def _append_log(self, manifest: Dict[str, object], message: str) -> None:
         manifest.setdefault("logs", []).append(
@@ -365,7 +432,31 @@ class BookConverter:
     def _legacy_manifest_path(self, book_id: str) -> Path:
         return (self.output_root / book_id).joinpath("manifest.json")
 
+    def _manifest_remote_key(self, book_id: str, voice_id: Optional[str]) -> str:
+        return f"generated_audio/{book_id}/{self._voice_namespace(voice_id)}/manifest.json"
+
+    def _chunk_remote_key(self, book_id: str, voice_id: Optional[str], filename: str) -> str:
+        return f"generated_audio/{book_id}/{self._voice_namespace(voice_id)}/{filename}"
+
     def _migrate_legacy_manifest(self, book_id: str, manifest: Dict[str, object], voice_id: Optional[str]) -> None:
+        voice_ns = self._voice_namespace(voice_id)
+
+        if self.remote_enabled:
+            for chunk in manifest.get("chunks", []):
+                file_name = chunk.get("file")
+                if not file_name:
+                    continue
+                legacy_file = (self.output_root / book_id) / file_name
+                if legacy_file.exists():
+                    r2_client.upload_file(legacy_file, self._chunk_remote_key(book_id, voice_id, file_name))
+                    legacy_file.unlink(missing_ok=True)
+            manifest["voice_key"] = voice_ns
+            self._save_manifest(manifest)
+            legacy_manifest = self._legacy_manifest_path(book_id)
+            if legacy_manifest.exists():
+                legacy_manifest.unlink(missing_ok=True)
+            return
+
         legacy_dir = self.output_root / book_id
         new_dir = self._book_output_dir(book_id, voice_id)
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -379,9 +470,8 @@ class BookConverter:
             if legacy_file.exists():
                 legacy_file.replace(new_file)
 
-        manifest["voice_key"] = self._voice_namespace(voice_id)
-        manifest_path = new_dir / "manifest.json"
-        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        manifest["voice_key"] = voice_ns
+        self._save_manifest(manifest)
         legacy_manifest = self._legacy_manifest_path(book_id)
         legacy_manifest.unlink(missing_ok=True)
 

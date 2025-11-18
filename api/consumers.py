@@ -3,10 +3,13 @@ import asyncio
 import json
 import logging
 import base64
+import jwt
+from django.conf import settings
 from channels.generic.websocket import AsyncWebsocketConsumer
 from .tts_service import tts_service
 from .response_service import response_service
 from .book_service import BookConverter
+from accounts.db import USERS_COLLECTION
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +48,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
         self.book_progress = {}
         self.book_access_granted = False
         self.book_access_book_id = None
+        self.preferred_voice = None
 
     async def connect(self):
         try:
@@ -57,11 +61,39 @@ class ChatConsumer(AsyncWebsocketConsumer):
             )
 
             await self.accept()
+            await self._authenticate_user()
             logger.info(f"WebSocket connected: {self.channel_name}")
-
+            
         except Exception as e:
             logger.error(f"Error in WebSocket connect: {str(e)}")
             await self.close()
+
+    async def _authenticate_user(self):
+        token_value = None
+        query_string = self.scope.get("query_string", b"").decode()
+        if query_string:
+            for part in query_string.split("&"):
+                if part.startswith("token="):
+                    token_value = part.split("=", 1)[1]
+                    break
+        if not token_value:
+            headers = self.scope.get("headers")
+            if headers:
+                for header_name, header_value in headers:
+                    if header_name.decode().lower() == "authorization":
+                        value = header_value.decode()
+                        if value.lower().startswith("bearer "):
+                            token_value = value.split(" ", 1)[1]
+                        break
+        if not token_value:
+            return
+        try:
+            payload = jwt.decode(token_value, settings.SECRET_KEY, algorithms=["HS256"])
+            user = USERS_COLLECTION.find_one({"email": payload.get("email")})
+            if user:
+                self.preferred_voice = user.get("voice")
+        except Exception:
+            self.preferred_voice = None
 
     async def receive(self, text_data):
         message_id = ''
@@ -72,7 +104,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             if message_type == 'tts':
                 text = text_data_json.get('text') or text_data_json.get('message', '')
-                requested_voice = text_data_json.get('voice')
+                requested_voice = text_data_json.get('voice') or self.preferred_voice
                 if not text:
                     raise ValueError("No text provided for TTS")
 
