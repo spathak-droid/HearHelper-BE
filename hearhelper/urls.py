@@ -7,7 +7,8 @@ from api.views import websocket_test
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('test/', websocket_test, name='websocket_test'),
-    path('ws/', include('api.routing.websocket_urlpatterns')),  # Updated this line
+    path('ws/', websocket_test, name='legacy_websocket_test'),
+    path('auth/', include('accounts.urls')),
 ]
 
 if settings.DEBUG:

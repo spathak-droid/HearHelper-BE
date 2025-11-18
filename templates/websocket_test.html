@@ -3,92 +3,257 @@
 <head>
     <title>WebSocket Test</title>
     <style>
+        :root {
+            color-scheme: light dark;
+        }
         body {
             font-family: Arial, sans-serif;
-            max-width: 600px;
+            max-width: 700px;
             margin: 0 auto;
             padding: 20px;
+            background: #f7f7f7;
+        }
+        h1 {
+            text-align: center;
+        }
+        #status {
+            margin-bottom: 10px;
+            padding: 8px 12px;
+            border-radius: 4px;
+            background: #eaeaea;
+            font-size: 0.9rem;
+        }
+        #status.playing {
+            background: #d1fae5;
+            border: 1px solid #10b981;
+            color: #065f46;
+        }
+        #status.error {
+            background: #fee2e2;
+            border: 1px solid #dc2626;
+            color: #7f1d1d;
         }
         #messages {
-            height: 300px;
+            height: 330px;
             border: 1px solid #ccc;
             padding: 10px;
-            margin-bottom: 10px;
+            margin-bottom: 12px;
             overflow-y: auto;
+            background: white;
+        }
+        .message {
+            margin-bottom: 8px;
+            padding: 6px 8px;
+            border-radius: 4px;
+        }
+        .message.system {
+            background: #eef2ff;
+        }
+        .message.outbound {
+            background: #dbeafe;
+            text-align: right;
+        }
+        .message.inbound {
+            background: #fef3c7;
+        }
+        .message.error {
+            background: #fee2e2;
+        }
+        #inputBar {
+            display: flex;
+            gap: 10px;
         }
         #message {
-            width: 80%;
-            padding: 8px;
+            flex: 1;
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
         }
         button {
-            padding: 8px 15px;
+            padding: 10px 16px;
             background-color: #4CAF50;
             color: white;
             border: none;
+            border-radius: 4px;
             cursor: pointer;
         }
         button:hover {
             background-color: #45a049;
         }
+        audio {
+            width: 100%;
+            margin-bottom: 10px;
+        }
     </style>
 </head>
 <body>
     <h1>WebSocket Test</h1>
+    <div id="status">Idle</div>
     <div id="messages"></div>
-    <div>
+    <audio id="audioPlayer" controls preload="auto"></audio>
+    <div id="playbackControls" style="display:none;">
+        <button id="nextChunkBtn" onclick="requestNextChunk()">Next Chunk ▶</button>
+    </div>
+    <div id="inputBar">
         <input type="text" id="message" placeholder="Type your message">
         <button onclick="sendMessage()">Send</button>
     </div>
 
     <script>
-        // Connect to WebSocket
+        let messageCounter = 0;
         const socket = new WebSocket('ws://' + window.location.host + '/ws/hat/');
-        
-        // Connection opened
-        socket.onopen = function(e) {
-            logMessage('Connected to WebSocket server');
+        const statusEl = document.getElementById('status');
+        const audioPlayer = document.getElementById('audioPlayer');
+        const playbackControls = document.getElementById('playbackControls');
+        const nextChunkBtn = document.getElementById('nextChunkBtn');
+        let currentBook = null;
+
+        socket.onopen = () => {
+            logMessage('Connected to WebSocket server', 'system');
         };
 
-        // Listen for messages
-        socket.onmessage = function(e) {
-            const data = JSON.parse(e.data);
-            logMessage('Received: ' + data.message);
+        socket.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                handleIncomingMessage(data);
+            } catch (err) {
+                logMessage('Malformed message from server', 'error');
+            }
         };
 
-        // Connection closed
-        socket.onclose = function(e) {
-            logMessage('Disconnected from WebSocket server');
+        socket.onclose = () => {
+            setStatus('Connection closed', 'error');
+            logMessage('Disconnected from WebSocket server', 'system');
         };
 
-        // Error handling
-        socket.onerror = function(error) {
-            logMessage('WebSocket Error: ' + error.message);
+        socket.onerror = (error) => {
+            setStatus('WebSocket error', 'error');
+            logMessage('WebSocket Error: ' + error.message, 'error');
         };
 
-        // Send message function
         function sendMessage() {
             const input = document.getElementById('message');
             const message = input.value.trim();
-            
-            if (message) {
-                socket.send(JSON.stringify({
-                    'message': message
-                }));
-                logMessage('Sent: ' + message);
-                input.value = '';
+            if (!message) {
+                return;
             }
+            const payload = {
+                type: 'tts',
+                text: message,
+                message_id: createMessageId()
+            };
+            socket.send(JSON.stringify(payload));
+            logMessage('You: ' + message, 'outbound');
+            input.value = '';
+            setStatus('Waiting for reply…');
         }
 
-        // Helper function to log messages to the UI
-        function logMessage(message) {
+        function handleIncomingMessage(data) {
+            if (data.type === 'error') {
+                logMessage('Error: ' + data.details, 'error');
+                setStatus('Error: ' + (data.details || 'unknown'), 'error');
+                return;
+            }
+
+            if (data.type === 'tts_result' || data.type === 'book_playback') {
+                const text = data.text || '';
+                logMessage('Assistant: ' + text, 'inbound');
+                if (data.match && data.match.prompt) {
+                    logMessage('Matched prompt: ' + data.match.prompt + ` (${Math.round((data.match.confidence || 0) * 100)}%)`, 'system');
+                }
+                if (data.context && Array.isArray(data.context.suggestions)) {
+                    const titles = data.context.suggestions.map(s => `${s.title}${s.description ? ' — ' + s.description : ''}`);
+                    if (titles.length) {
+                        logMessage('Suggestions: ' + titles.join('; '), 'system');
+                    }
+                }
+                if (data.book) {
+                    currentBook = data.book;
+                    logMessage(`Playing "${data.book.title}" (chunk ${data.book.chunk}/${data.book.total_chunks})`, 'system');
+                    updatePlaybackControls();
+                } else {
+                    currentBook = null;
+                    updatePlaybackControls(true);
+                }
+                if (data.audio) {
+                    playAudio(data.audio, data.format || 'mp3');
+                } else {
+                    setStatus('Reply received (no audio)');
+                }
+                return;
+            }
+
+            logMessage('Server: ' + JSON.stringify(data), 'system');
+        }
+
+        function requestNextChunk() {
+            if (!currentBook) {
+                return;
+            }
+            const payload = {
+                type: 'tts',
+                text: 'next chunk',
+                message_id: createMessageId()
+            };
+            socket.send(JSON.stringify(payload));
+            logMessage('You: [Next chunk]', 'outbound');
+            setStatus('Requesting next chunk…');
+        }
+
+        function updatePlaybackControls(forceHide = false) {
+            if (forceHide || !currentBook) {
+                playbackControls.style.display = 'none';
+                return;
+            }
+            if (currentBook.chunk >= currentBook.total_chunks) {
+                playbackControls.style.display = 'none';
+                return;
+            }
+            playbackControls.style.display = 'block';
+            nextChunkBtn.textContent = `Next Chunk ▶ (${currentBook.chunk + 1}/${currentBook.total_chunks})`;
+        }
+
+        function playAudio(base64Audio, format) {
+            const mime = formatToMime(format);
+            const src = `data:audio/${mime};base64,${base64Audio}`;
+            audioPlayer.src = src;
+            const playPromise = audioPlayer.play();
+            if (playPromise && playPromise.then) {
+                playPromise
+                    .then(() => setStatus('Playing audio…', 'playing'))
+                    .catch(() => setStatus('Audio ready (tap play)', 'system'));
+            } else {
+                setStatus('Audio ready', 'system');
+            }
+            audioPlayer.onended = () => setStatus('Playback finished');
+        }
+
+        function formatToMime(format) {
+            const fmt = (format || '').toLowerCase();
+            if (fmt === 'mp3') return 'mpeg';
+            if (fmt === 'wav') return 'wav';
+            return fmt || 'mpeg';
+        }
+
+        function setStatus(text, type = '') {
+            statusEl.textContent = text;
+            statusEl.className = type ? type : '';
+        }
+
+        function logMessage(message, kind = 'system') {
             const messagesDiv = document.getElementById('messages');
             const messageElement = document.createElement('div');
+            messageElement.className = 'message ' + kind;
             messageElement.textContent = message;
             messagesDiv.appendChild(messageElement);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
         }
 
-        // Allow sending message with Enter key
+        function createMessageId() {
+            messageCounter += 1;
+            return `msg-${Date.now()}-${messageCounter}`;
+        }
+
         document.getElementById('message').addEventListener('keypress', function(e) {
             if (e.key === 'Enter') {
                 sendMessage();
