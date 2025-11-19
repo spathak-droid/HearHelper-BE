@@ -111,7 +111,7 @@ class TTSService:
 
         if self.piper_enabled:
             self._discover_models()
-            if not self.models:
+            if not self.models and not self.remote_models:
                 logger.warning(
                     "Piper is installed but no models were found in %s. Falling back to gTTS.",
                     self.models_dir,
@@ -195,7 +195,7 @@ class TTSService:
 
     def available_voices(self) -> Tuple[str, ...]:
         """Return the list of discovered voice ids."""
-        if not self.piper_enabled:
+        if not self.piper_enabled and not self.remote_models:
             return tuple()
         voice_ids = set(self.remote_models)
         voice_ids.update(self.models.keys())
@@ -322,12 +322,19 @@ class TTSService:
             )
 
         self.models = discovered
+        self._refresh_remote_models()
 
         if not self.models:
-            logger.warning(
-                "No Piper models discovered in %s. Add .onnx/.onnx.json pairs to enable speech.",
-                self.models_dir,
-            )
+            if self.remote_models:
+                logger.info(
+                    "No local Piper models found, but %d remote voices detected in R2.",
+                    len(self.remote_models),
+                )
+            else:
+                logger.warning(
+                    "No Piper models discovered in %s. Add .onnx/.onnx.json pairs to enable speech.",
+                    self.models_dir,
+                )
             self.default_voice_id = None
             return
 
@@ -344,7 +351,6 @@ class TTSService:
             ", ".join(sorted(self.models.keys())),
             self.default_voice_id,
         )
-        self._refresh_remote_models()
 
     def _select_model(
         self,

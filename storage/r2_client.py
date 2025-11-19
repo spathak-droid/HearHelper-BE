@@ -121,3 +121,37 @@ def list_objects(prefix: str) -> list[str]:
     except (BotoCoreError, ClientError) as exc:
         logger.info("R2 list_objects error for %s: %s", prefix, exc)
     return objects
+
+
+def generate_presigned_url(
+    remote_key: str,
+    method: str = "get_object",
+    expires_in: int = 900,
+    content_type: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Generate a temporary signed URL for the given object.
+
+    Args:
+        remote_key: Object key within the bucket.
+        method: "get_object" or "put_object".
+        expires_in: Seconds before the URL expires.
+        content_type: Optional Content-Type restriction (useful for uploads).
+    """
+    client, bucket = _get_client()
+    if client is None:
+        return None
+
+    params: dict[str, str] = {"Bucket": bucket, "Key": remote_key}
+    if method == "put_object" and content_type:
+        params["ContentType"] = content_type
+
+    try:
+        return client.generate_presigned_url(
+            ClientMethod=method,
+            Params=params,
+            ExpiresIn=expires_in,
+        )
+    except (BotoCoreError, ClientError, ValueError) as exc:
+        logger.warning("Failed to generate presigned URL for %s: %s", remote_key, exc)
+        return None

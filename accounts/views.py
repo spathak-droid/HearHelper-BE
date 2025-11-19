@@ -4,6 +4,7 @@ import base64
 import json
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import jwt
 from django.conf import settings
@@ -15,6 +16,13 @@ from .db import USERS_COLLECTION
 from api.tts_service import tts_service
 from storage import r2_client
 from voice_common_names import VOICE_COMMON_NAMES
+
+ALLOWED_IMAGE_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 
 def _json_error(message, status=400, **extra):
@@ -44,6 +52,47 @@ def _require_auth(request):
         return None, _json_error("Token expired.", status=401)
     except jwt.InvalidTokenError:
         return None, _json_error("Invalid token.", status=401)
+
+
+def _resolve_image_upload(data: dict) -> tuple[str, str]:
+    """
+    Determine the file extension and content type for profile uploads.
+    """
+    extension = (
+        data.get("extension")
+        or data.get("file_extension")
+        or data.get("ext")
+        or ""
+    )
+    extension = extension.strip().lower()
+    if extension and not extension.startswith("."):
+        extension = f".{extension}"
+
+    content_type = (data.get("content_type") or "").strip().lower()
+
+    if extension:
+        if extension not in ALLOWED_IMAGE_TYPES:
+            raise ValueError("Unsupported image extension.")
+        inferred = ALLOWED_IMAGE_TYPES[extension]
+        if content_type and content_type != inferred:
+            raise ValueError("Content type does not match extension.")
+        return extension, inferred
+
+    if content_type:
+        for ext, ct in ALLOWED_IMAGE_TYPES.items():
+            if ct == content_type:
+                return ext, ct
+        raise ValueError("Unsupported content type.")
+
+    return ".jpg", ALLOWED_IMAGE_TYPES[".jpg"]
+
+
+def _profile_photo_url(key: Optional[str], expires: int = 900) -> Optional[str]:
+    if not key or not r2_client.is_enabled():
+        return None
+    if not r2_client.object_exists(key):
+        return None
+    return r2_client.generate_presigned_url(key, method="get_object", expires_in=expires)
 
 
 @csrf_exempt
@@ -84,13 +133,16 @@ def signup(request):
     doc["_id"] = result.inserted_id
     token = _generate_token(doc)
 
-    return JsonResponse(
-        {
-            "message": "Signup successful",
-            "token": token,
-        },
-        status=201,
-    )
+    response = {
+        "message": "Signup successful",
+        "token": token,
+    }
+    response["user"] = {
+        "email": doc["email"],
+        "profile_photo_url": _profile_photo_url(doc.get("profile_photo_key")),
+    }
+
+    return JsonResponse(response, status=201)
 
 
 @csrf_exempt
@@ -115,17 +167,20 @@ def signin(request):
 
     token = _generate_token(user)
     user_voice = user.get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
+    user_payload = {
+        "first_name": user.get("first_name"),
+        "last_name": user.get("last_name"),
+        "email": user.get("email"),
+        "voice": user_voice,
+        "voice_common_name": VOICE_COMMON_NAMES.get(user_voice, user_voice),
+    }
+    user_payload["profile_photo_url"] = _profile_photo_url(user.get("profile_photo_key"))
+
     return JsonResponse(
         {
             "message": "Signin successful",
             "token": token,
-            "user": {
-                "first_name": user.get("first_name"),
-                "last_name": user.get("last_name"),
-                "email": user.get("email"),
-                "voice": user_voice,
-                "voice_common_name": VOICE_COMMON_NAMES.get(user_voice, user_voice),
-            },
+            "user": user_payload,
         }
     )
 
@@ -159,6 +214,62 @@ def available_models(request):
             "count": len(models),
         }
     )
+
+
+@csrf_exempt
+def profile_photo_upload_url(request):
+    if request.method != "POST":
+        return _json_error("Method not allowed", status=405)
+
+    payload, error_response = _require_auth(request)
+    if error_response:
+        return error_response
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON payload")
+
+    try:
+        extension, content_type = _resolve_image_upload(data)
+    except ValueError as exc:
+        return _json_error(str(exc))
+
+    if not r2_client.is_enabled():
+        return _json_error("Cloud storage is not configured.", status=503)
+
+    key_prefix = os.getenv("R2_PROFILE_DIR", "users")
+    user_id = payload.get("sub") or payload["email"]
+    remote_key = f"{key_prefix.rstrip('/')}/{user_id}{extension}"
+
+    upload_url = r2_client.generate_presigned_url(
+        remote_key,
+        method="put_object",
+        expires_in=900,
+        content_type=content_type,
+    )
+
+    if upload_url is None:
+        return _json_error("Failed to generate upload URL.", status=502)
+
+    USERS_COLLECTION.update_one(
+        {"email": payload["email"]},
+        {"$set": {"profile_photo_key": remote_key, "updated_at": datetime.utcnow()}},
+    )
+
+    download_url = _profile_photo_url(remote_key)
+
+    return JsonResponse(
+        {
+            "upload_url": upload_url,
+            "download_url": download_url,
+            "object_key": remote_key,
+            "content_type": content_type,
+            "expires_in": 900,
+        }
+    )
+
+
 
 
 @csrf_exempt
