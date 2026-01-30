@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .book_sources import BookSourceManager
+from .ssml import build_book_ssml
 from .tts_service import tts_service
 from storage import r2_client
 
@@ -35,15 +36,42 @@ CHAPTER_ONE_PATTERN = re.compile(
     r"^\s*(chapter|book|part)\s+(1|i|one)\b",
     re.IGNORECASE,
 )
+MIN_BODY_CHARS = 90
+MIN_BODY_WORDS = 15
+
+
+def _looks_like_body(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    if not stripped:
+        return False
+    if len(stripped) >= MIN_BODY_CHARS:
+        return True
+    word_count = len(stripped.split())
+    if word_count >= MIN_BODY_WORDS and "." in stripped:
+        return True
+    return False
+
+
+def _next_body_paragraph(start_idx: int, paragraphs: Sequence[str]) -> Optional[int]:
+    for offset in range(start_idx + 1, len(paragraphs)):
+        candidate = paragraphs[offset].strip()
+        if not candidate:
+            continue
+        if _looks_like_body(candidate):
+            return offset
+        # if we encounter another chapter heading immediately, treat prior as table of contents
+        if CHAPTER_PATTERN.match(candidate):
+            return None
+    return None
 
 
 def _trim_front_matter(paragraphs: Sequence[str]) -> List[str]:
     """
-    Remove prefaces/table of contents until the second Chapter 1 heading if possible,
-    otherwise fall back to the second general chapter heading.
+    Remove prefaces/table of contents until a chapter heading that is followed by a body paragraph.
+    Prefer Chapter One headings, but fall back to any chapter heading that passes the body heuristic.
     """
-    chapter_one_hits = []
-    chapter_hits = []
+    valid_chapter_one_hits = []
+    valid_chapter_hits = []
 
     for idx, paragraph in enumerate(paragraphs):
         normalized = paragraph.strip()
@@ -51,19 +79,22 @@ def _trim_front_matter(paragraphs: Sequence[str]) -> List[str]:
             continue
 
         if CHAPTER_ONE_PATTERN.match(normalized):
-            chapter_one_hits.append(idx)
-            if len(chapter_one_hits) >= 2:
-                return list(paragraphs[chapter_one_hits[1]:])
+            if _next_body_paragraph(idx, paragraphs) is not None:
+                valid_chapter_one_hits.append(idx)
+                if len(valid_chapter_one_hits) >= 2:
+                    return list(paragraphs[valid_chapter_one_hits[1]:])
+            continue
 
         if CHAPTER_PATTERN.match(normalized):
-            chapter_hits.append(idx)
-            if len(chapter_hits) >= 2:
-                return list(paragraphs[chapter_hits[1]:])
+            if _next_body_paragraph(idx, paragraphs) is not None:
+                valid_chapter_hits.append(idx)
+                if len(valid_chapter_hits) >= 2:
+                    return list(paragraphs[valid_chapter_hits[1]:])
 
-    if chapter_one_hits:
-        return list(paragraphs[chapter_one_hits[-1]:])
-    if chapter_hits:
-        return list(paragraphs[chapter_hits[-1]:])
+    if valid_chapter_one_hits:
+        return list(paragraphs[valid_chapter_one_hits[-1]:])
+    if valid_chapter_hits:
+        return list(paragraphs[valid_chapter_hits[-1]:])
     return list(paragraphs)
 
 
@@ -78,14 +109,14 @@ def _chunk_paragraphs(
     for paragraph in paragraphs:
         paragraph_len = len(paragraph)
         if current and (current_len + paragraph_len + 1) > chunk_chars:
-            chunks.append(" ".join(current))
+            chunks.append("\n\n".join(current))
             current = []
             current_len = 0
         current.append(paragraph)
         current_len += paragraph_len + 1
 
     if current:
-        chunks.append(" ".join(current))
+        chunks.append("\n\n".join(current))
 
     return chunks
 
@@ -275,10 +306,15 @@ class BookConverter:
                 return manifest
 
         text = chunk_entry.get("text", "")
+        ssml_text = chunk_entry.get("ssml")
+        if not ssml_text and text:
+            ssml_text = build_book_ssml(text)
+            chunk_entry["ssml"] = ssml_text
         audio_data, error, used_voice, audio_format = await tts_service.text_to_speech(
             text,
             voice_id=voice_id,
             preferred_format=preferred_format or manifest.get("format") or DEFAULT_AUDIO_FORMAT,
+            ssml_text=ssml_text,
         )
 
         if error:
@@ -336,6 +372,7 @@ class BookConverter:
                 "index": idx,
                 "chunk_number": idx + 1,
                 "text": chunk_text,
+                "ssml": None,
                 "file": None,
                 "generated": False,
                 "generated_at": None,
@@ -366,7 +403,9 @@ class BookConverter:
             data = r2_client.download_bytes(remote_key)
             if data:
                 try:
-                    return json.loads(data.decode("utf-8"))
+                    manifest = json.loads(data.decode("utf-8"))
+                    _ensure_chunk_schema(manifest)
+                    return manifest
                 except json.JSONDecodeError:
                     pass
             legacy_path = self._legacy_manifest_path(book_id)
@@ -377,6 +416,7 @@ class BookConverter:
                     legacy_path.unlink(missing_ok=True)
                     return None
                 self._migrate_legacy_manifest(book_id, manifest, voice_id)
+                _ensure_chunk_schema(manifest)
                 return manifest
             return None
 
@@ -394,11 +434,13 @@ class BookConverter:
                 return manifest
             return None
         try:
-            return json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             logger.warning("Manifest for book %s is corrupted; starting over.", book_id)
             manifest_path.unlink(missing_ok=True)
             return None
+        _ensure_chunk_schema(manifest)
+        return manifest
 
     def _save_manifest(self, manifest: Dict[str, object]) -> None:
         voice_ns = manifest.get("voice_key") or self._voice_namespace(manifest.get("voice"))
@@ -484,3 +526,13 @@ class BookConverter:
         if path.exists():
             return path
         return self.book_sources.ensure_downloaded(book_id)
+
+
+def _ensure_chunk_schema(manifest: Dict[str, object]) -> None:
+    chunks = manifest.get("chunks")
+    if not isinstance(chunks, list):
+        return
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        chunk.setdefault("ssml", None)

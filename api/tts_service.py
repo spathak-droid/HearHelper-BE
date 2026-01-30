@@ -12,6 +12,8 @@ from typing import Any, Dict, Optional, Tuple
 from gtts import gTTS
 
 from storage import r2_client
+from .ssml import ssml_to_plain_text
+from .text_enricher import enrich_text_for_tts
 
 try:
     from pydub import AudioSegment
@@ -108,6 +110,7 @@ class TTSService:
         self.gtts_lang = os.getenv("GTTS_LANG", "en")
         self._gtts_format = "mp3"
         self.remote_models: set[str] = set()
+        self.allow_ssml_passthrough = os.getenv("TTS_ALLOW_SSML", "").lower() in {"1", "true", "yes", "on"}
 
         if self.piper_enabled:
             self._discover_models()
@@ -127,6 +130,7 @@ class TTSService:
         text: str,
         voice_id: Optional[str] = None,
         preferred_format: Optional[str] = None,
+        ssml_text: Optional[str] = None,
     ) -> Tuple[Optional[bytes], Optional[str], Optional[str], str]:
         """
         Convert text to speech asynchronously.
@@ -135,6 +139,7 @@ class TTSService:
             text: Text to convert.
             voice_id: Optional id of the Piper model to use.
             preferred_format: Target audio format (e.g., "mp3").
+            ssml_text: Optional SSML markup to drive pauses/prosody.
 
         Returns:
             Tuple of (audio_data, error_message, used_voice_id, audio_format)
@@ -143,11 +148,8 @@ class TTSService:
             preferred_format.lower() if preferred_format else preferred_format
         )
 
-        if not text or not isinstance(text, str):
-            return None, "Invalid text input", None, self._determine_format(preferred_format)
-
-        text = text.strip()
-        if not text:
+        prepared_text = self._prepare_text_payload(text, ssml_text)
+        if not prepared_text:
             return None, "Invalid text input", None, self._determine_format(preferred_format)
 
         loop = asyncio.get_running_loop()
@@ -164,7 +166,7 @@ class TTSService:
                     audio_data = await loop.run_in_executor(
                         None,
                         model.synthesize,
-                        text,
+                        prepared_text,
                     )
                     return await self._ensure_format(
                         audio_data,
@@ -189,8 +191,9 @@ class TTSService:
 
         return await self._synthesize_with_gtts_async(
             loop,
-            text,
+            prepared_text,
             preferred_format=preferred_format,
+            metadata_voice=voice_id or self.default_voice_id,
         )
 
     def available_voices(self) -> Tuple[str, ...]:
@@ -206,6 +209,7 @@ class TTSService:
         loop: asyncio.AbstractEventLoop,
         text: str,
         preferred_format: Optional[str],
+        metadata_voice: Optional[str],
     ) -> Tuple[Optional[bytes], Optional[str], Optional[str], str]:
         try:
             audio_data = await loop.run_in_executor(
@@ -216,12 +220,12 @@ class TTSService:
             return await self._ensure_format(
                 audio_data,
                 source_format=self._gtts_format,
-                voice_id=None,
+                voice_id=metadata_voice,
                 preferred_format=preferred_format,
             )
         except Exception as exc:
             logger.error("Error in gTTS fallback: %s", exc, exc_info=True)
-            return None, str(exc), None, self._gtts_format
+            return None, str(exc), metadata_voice, self._gtts_format
 
     def _synthesize_with_gtts(self, text: str) -> bytes:
         buffer = BytesIO()
@@ -299,6 +303,30 @@ class TTSService:
             return default_format
         return self._gtts_format
 
+    def _prepare_text_payload(self, raw_text: object, ssml_text: Optional[str]) -> Optional[str]:
+        """
+        Decide which text should be fed into the synthesis engine.
+
+        When SSML is provided we either pass it through (if explicitly allowed)
+        or downgrade to plain text with pause markers so Piper/gTTS can work.
+        """
+        base_text = raw_text.strip() if isinstance(raw_text, str) else ""
+        ssml_candidate = ssml_text.strip() if isinstance(ssml_text, str) else None
+
+        if ssml_candidate:
+            if self.allow_ssml_passthrough:
+                return ssml_candidate
+            downgrade = ssml_to_plain_text(ssml_candidate)
+            if downgrade:
+                return downgrade
+            # Fall back to whatever plain text we have
+
+        if not base_text:
+            return None
+
+        enriched = enrich_text_for_tts(base_text)
+        return enriched or base_text
+
     def _discover_models(self) -> None:
         discovered: Dict[str, PiperVoiceModel] = {}
 
@@ -356,7 +384,16 @@ class TTSService:
         self,
         requested_voice_id: Optional[str],
     ) -> Tuple[Optional[str], Optional[PiperVoiceModel]]:
-        if not self.piper_enabled or not self.models:
+        if not self.piper_enabled:
+            return None, None
+
+        # Lazy-fetch remote assets if we have voices listed remotely but none on disk yet.
+        if not self.models and self.remote_models:
+            candidate = requested_voice_id or self.default_voice_id or next(iter(self.remote_models))
+            if self._download_voice_assets(candidate):
+                self._discover_models()
+
+        if not self.models:
             return None, None
 
         model = None

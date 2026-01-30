@@ -2,20 +2,27 @@ import os
 import asyncio
 import base64
 import json
+import logging
+import secrets
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+from urllib.parse import urlencode
 
 import jwt
+import requests
 from django.conf import settings
 from django.contrib.auth.hashers import check_password, make_password
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
 from .db import USERS_COLLECTION
+from . import auth0_mgmt
 from api.tts_service import tts_service
 from storage import r2_client
 from voice_common_names import VOICE_COMMON_NAMES
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_IMAGE_TYPES = {
     ".jpg": "image/jpeg",
@@ -87,12 +94,70 @@ def _resolve_image_upload(data: dict) -> tuple[str, str]:
     return ".jpg", ALLOWED_IMAGE_TYPES[".jpg"]
 
 
-def _profile_photo_url(key: Optional[str], expires: int = 900) -> Optional[str]:
-    if not key or not r2_client.is_enabled():
+def _profile_photo_url(key: Optional[str], *, ensure_exists: bool = True, expires: int = 900) -> Optional[str]:
+    if not key:
         return None
-    if not r2_client.object_exists(key):
+
+    public_base = os.getenv("R2_PUBLIC_DOMAIN_URL") or os.getenv("R2_PROFILE_PUBLIC_BASE_URL")
+    if public_base:
+        return f"{public_base.rstrip('/')}/{key.lstrip('/')}"
+
+    if not r2_client.is_enabled():
         return None
-    return r2_client.generate_presigned_url(key, method="get_object", expires_in=expires)
+    if ensure_exists and not r2_client.object_exists(key):
+        return None
+    # provide a longer-lived signed URL when no public base is configured
+    return r2_client.generate_presigned_url(
+        key,
+        method="get_object",
+        expires_in=max(expires, 86400),
+    )
+
+
+def _oauth_settings() -> Tuple[str, str, str, Optional[str], Optional[str]]:
+    domain = os.getenv("OAUTH_DOMAIN")
+    client_id = os.getenv("OAUTH_CLIENT_ID")
+    client_secret = os.getenv("OAUTH_CLIENT_SECRET")
+    audience = os.getenv("OAUTH_AUDIENCE")
+    default_redirect = os.getenv("OAUTH_REDIRECT_URI")
+    if not all([domain, client_id, client_secret]):
+        raise RuntimeError("OAuth configuration is incomplete. Set OAUTH_DOMAIN, OAUTH_CLIENT_ID, and OAUTH_CLIENT_SECRET.")
+    return domain, client_id, client_secret, audience, default_redirect
+
+
+def _oauth_upsert_user(profile: dict) -> tuple[dict, bool]:
+    email = (profile.get("email") or "").strip().lower()
+    if not email:
+        raise ValueError("OAuth profile did not include an email address.")
+
+    user = USERS_COLLECTION.find_one({"email": email})
+    first_name = (profile.get("given_name") or profile.get("name") or "").split(" ")[0] or "Guest"
+    last_name = profile.get("family_name") or ""
+    voice = profile.get("app_metadata", {}).get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
+
+    if user:
+        update = {
+            "first_name": first_name or user.get("first_name"),
+            "last_name": last_name or user.get("last_name"),
+            "updated_at": datetime.utcnow(),
+        }
+        USERS_COLLECTION.update_one({"_id": user["_id"]}, {"$set": update})
+        user.update(update)
+        return user, False
+
+    now = datetime.utcnow()
+    doc = {
+        "first_name": first_name,
+        "last_name": last_name,
+        "email": email,
+        "voice": voice,
+        "created_at": now,
+        "updated_at": now,
+        "oauth_provider": "google",
+    }
+    result = USERS_COLLECTION.insert_one(doc)
+    doc["_id"] = result.inserted_id
+    return doc, True
 
 
 @csrf_exempt
@@ -109,25 +174,89 @@ def signup(request):
     last_name = (data.get("last_name") or "").strip()
     email = (data.get("email") or "").strip().lower()
     password = data.get("password")
-    voice = (data.get("voice") or "").strip() or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
+    voice = (data.get("voice") or "").strip() or os.getenv("PIPER_DEFAULT_VOICE", "en_US-amy-medium")
 
     if not all([first_name, last_name, email, password]):
         return _json_error("All fields are required: first_name, last_name, email, password.")
 
-    if USERS_COLLECTION.find_one({"email": email}):
-        return _json_error("An account with this email already exists.", status=409)
+    # Check if user exists in MongoDB
+    existing_user = USERS_COLLECTION.find_one({"email": email})
+    if existing_user:
+        logger.warning(f"User {email} already exists in MongoDB")
+        # If user exists in MongoDB but not in Auth0, we'll still allow the process to continue
+        # This handles the case where Auth0 user creation previously failed
+        if auth0_mgmt.is_configured() and not auth0_mgmt.user_exists(email):
+            logger.info(f"User {email} exists in MongoDB but not in Auth0, will attempt to create Auth0 user")
+        else:
+            return _json_error("An account with this email already exists.", status=409, errorCode="account_exists")
 
     hashed_password = make_password(password)
+    auth0_id = None
+    
+    # If user exists in MongoDB but not in Auth0, try to get the auth0_id from the existing user
+    if existing_user and 'auth0_id' in existing_user:
+        auth0_id = existing_user['auth0_id']
+    if auth0_mgmt.is_configured():
+        try:
+            # First, try to get the user by email
+            auth0_user = auth0_mgmt.get_user_by_email(email)
+            if auth0_user:
+                auth0_id = auth0_user.get('user_id')
+                logger.info(f"Found existing Auth0 user: {auth0_id}")
+            else:
+                # User doesn't exist, try to create
+                logger.info(f"Attempting to create Auth0 user for email: {email}")
+                created = auth0_mgmt.create_user(
+                    email=email,
+                    password=password,
+                    first_name=first_name,
+                    last_name=last_name,
+                )
+                auth0_id = created.get("user_id")
+                logger.info(f"Successfully created Auth0 user: {auth0_id}")
+                
+        except Exception as exc:
+            # If we get a 409, try to get the user again
+            if hasattr(exc, 'response') and hasattr(exc.response, 'status_code') and exc.response.status_code == 409:
+                logger.warning(f"Auth0 reported conflict for {email}, attempting to fetch user...")
+                auth0_user = auth0_mgmt.get_user_by_email(email)
+                if auth0_user:
+                    auth0_id = auth0_user.get('user_id')
+                    logger.info(f"Retrieved existing Auth0 user after conflict: {auth0_id}")
+                else:
+                    logger.error("Auth0 reported conflict but user not found. This might indicate a race condition.")
+            else:
+                logger.error(f"Auth0 operation failed for {email}", exc_info=True)
+                logger.warning("Proceeding with local user creation despite Auth0 failure")
+    else:
+        logger.warning("Auth0 is not configured. User will be created locally only.")
+
     now = datetime.utcnow()
-    doc = {
+    update_doc = {
         "first_name": first_name,
         "last_name": last_name,
-        "email": email,
         "password": hashed_password,
-        "created_at": now,
         "updated_at": now,
         "voice": voice,
     }
+    
+    if existing_user:
+        # Update existing user
+        USERS_COLLECTION.update_one(
+            {"email": email},
+            {"$set": {**update_doc, "auth0_id": auth0_id}}
+        )
+        doc = {**existing_user, **update_doc, "auth0_id": auth0_id}
+    else:
+        # Create new user
+        doc = {
+            **update_doc,
+            "email": email,
+            "created_at": now,
+            "email_verified": False,
+            "auth0_id": auth0_id,
+        }
+        USERS_COLLECTION.insert_one(doc)
 
     result = USERS_COLLECTION.insert_one(doc)
     doc["_id"] = result.inserted_id
@@ -165,6 +294,60 @@ def signin(request):
     if not user or not check_password(password, user.get("password", "")):
         return _json_error("Invalid credentials.", status=401)
 
+    auth0_id = user.get("auth0_id")
+    if auth0_mgmt.is_configured():
+        if not auth0_id:
+            auth0_record = None
+            try:
+                auth0_record = auth0_mgmt.find_user_by_email(email)
+            except Exception as exc:  # pragma: no cover - best effort lookup
+                logger.warning("Auth0 lookup by email failed for %s: %s", email, exc)
+            if auth0_record is None:
+                try:
+                    auth0_record = auth0_mgmt.create_user(
+                        email=email,
+                        password=password,
+                        first_name=user.get("first_name") or "",
+                        last_name=user.get("last_name") or "",
+                    )
+                except Exception as exc:  # pragma: no cover - legacy fallback
+                    logger.warning("Auth0 provisioning during signin failed for %s: %s", email, exc)
+            if auth0_record:
+                auth0_id = auth0_record.get("user_id")
+                USERS_COLLECTION.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"auth0_id": auth0_id, "email_verified": False}},
+                )
+                user["auth0_id"] = auth0_id
+                user["email_verified"] = False
+        if auth0_id:
+            try:
+                auth0_profile = auth0_mgmt.get_user(auth0_id)
+            except Exception as exc:  # pragma: no cover - network errors
+                logger.warning("Auth0 lookup failed for %s: %s", email, exc)
+                auth0_profile = None
+            if auth0_profile is not None:
+                verified = bool(auth0_profile.get("email_verified"))
+                USERS_COLLECTION.update_one(
+                    {"_id": user["_id"]},
+                    {"$set": {"email_verified": verified}},
+                )
+                user["email_verified"] = verified
+            else:
+                verified = bool(user.get("email_verified"))
+            if not verified:
+                auth0_mgmt.trigger_verification_email(auth0_id)
+                return _json_error(
+                    "Please verify your email address. We've sent a verification email through Auth0.",
+                    status=403,
+                )
+        else:
+            return _json_error(
+                "Unable to verify email right now. Please try again in a few minutes.",
+                status=503,
+                errorCode="email"
+            )
+
     token = _generate_token(user)
     user_voice = user.get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
     user_payload = {
@@ -173,6 +356,7 @@ def signin(request):
         "email": user.get("email"),
         "voice": user_voice,
         "voice_common_name": VOICE_COMMON_NAMES.get(user_voice, user_voice),
+        "role": user.get("role"),
     }
     user_payload["profile_photo_url"] = _profile_photo_url(user.get("profile_photo_key"))
 
@@ -181,6 +365,134 @@ def signin(request):
             "message": "Signin successful",
             "token": token,
             "user": user_payload,
+        }
+    )
+
+
+@csrf_exempt
+def oauth_login_url(request):
+    if request.method not in ("GET", "POST"):
+        return _json_error("Method not allowed", status=405)
+
+    body: dict = {}
+    if request.method == "POST":
+        try:
+            body = json.loads(request.body.decode("utf-8"))
+        except json.JSONDecodeError:
+            return _json_error("Invalid JSON payload")
+    domain, client_id, _, audience, default_redirect = _oauth_settings()
+    redirect_uri = (
+        body.get("redirect_uri")
+        or request.GET.get("redirect_uri")
+        or default_redirect
+    )
+    if not redirect_uri:
+        return _json_error("redirect_uri is required.")
+
+    state = body.get("state") or request.GET.get("state") or secrets.token_urlsafe(16)
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": body.get("scope") or request.GET.get("scope") or "openid profile email",
+        "state": state,
+        "connection": "google-oauth2",
+        "prompt": body.get("prompt") or request.GET.get("prompt") or "login",
+    }
+    audience_param = body.get("audience") or request.GET.get("audience") or audience
+    if audience_param:
+        params["audience"] = audience_param
+
+    authorize_url = f"https://{domain}/authorize?{urlencode(params)}"
+    return JsonResponse({"authorize_url": authorize_url, "state": state})
+
+
+@csrf_exempt
+def oauth_callback(request):
+    if request.method != "POST":
+        return _json_error("Method not allowed", status=405)
+
+    try:
+        data = json.loads(request.body.decode("utf-8"))
+    except json.JSONDecodeError:
+        return _json_error("Invalid JSON payload")
+
+    code = data.get("code")
+    redirect_uri = data.get("redirect_uri")
+    if not code:
+        return _json_error("Authorization code is required.")
+
+    domain, client_id, client_secret, _, default_redirect = _oauth_settings()
+    redirect_uri = redirect_uri or default_redirect
+    if not redirect_uri:
+        return _json_error("redirect_uri is required.")
+
+    token_payload = {
+        "grant_type": "authorization_code",
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+
+    token_url = f"https://{domain}/oauth/token"
+    try:
+        token_response = requests.post(token_url, data=token_payload, timeout=10)
+    except requests.RequestException as exc:
+        return _json_error("OAuth token request failed.", status=502, details=str(exc))
+    if token_response.status_code >= 400:
+        try:
+            error_detail = token_response.json()
+        except ValueError:
+            error_detail = token_response.text
+        return _json_error("Failed to exchange authorization code.", status=502, details=error_detail)
+
+    token_data = token_response.json()
+    access_token = token_data.get("access_token")
+    if not access_token:
+        return _json_error("OAuth provider did not return an access token.", status=502)
+
+    try:
+        userinfo_resp = requests.get(
+            f"https://{domain}/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        return _json_error("OAuth userinfo request failed.", status=502, details=str(exc))
+    if userinfo_resp.status_code >= 400:
+        return _json_error("Failed to fetch user profile from OAuth provider.", status=502)
+
+    profile = userinfo_resp.json()
+    try:
+        user_doc, created = _oauth_upsert_user(profile)
+    except ValueError as exc:
+        return _json_error(str(exc), status=400)
+
+    token = _generate_token(user_doc)
+    user_voice = user_doc.get("voice") or os.getenv("PIPER_DEFAULT_VOICE", "en_US-hfc_male-medium")
+    user_payload = {
+        "first_name": user_doc.get("first_name"),
+        "last_name": user_doc.get("last_name"),
+        "email": user_doc.get("email"),
+        "voice": user_voice,
+        "voice_common_name": VOICE_COMMON_NAMES.get(user_voice, user_voice),
+        "role": user_doc.get("role"),
+    }
+    user_payload["profile_photo_url"] = _profile_photo_url(user_doc.get("profile_photo_key"))
+
+    return JsonResponse(
+        {
+            "message": "Signin successful" if not created else "Signup successful",
+            "token": token,
+            "user": user_payload,
+            "oauth": {
+                "access_token": access_token,
+                "expires_in": token_data.get("expires_in"),
+                "id_token": token_data.get("id_token"),
+                "scope": token_data.get("scope"),
+                "token_type": token_data.get("token_type"),
+            },
         }
     )
 
@@ -257,12 +569,13 @@ def profile_photo_upload_url(request):
         {"$set": {"profile_photo_key": remote_key, "updated_at": datetime.utcnow()}},
     )
 
-    download_url = _profile_photo_url(remote_key)
+    profile_url = _profile_photo_url(remote_key, ensure_exists=False)
 
     return JsonResponse(
         {
             "upload_url": upload_url,
-            "download_url": download_url,
+            "download_url": profile_url,
+            "profile_photo_url": profile_url,
             "object_key": remote_key,
             "content_type": content_type,
             "expires_in": 900,

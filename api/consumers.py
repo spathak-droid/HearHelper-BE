@@ -62,6 +62,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
 
             await self.accept()
             await self._authenticate_user()
+            logger.info("WS preferred voice: %s", self.preferred_voice)
             logger.info(f"WebSocket connected: {self.channel_name}")
             
         except Exception as e:
@@ -93,6 +94,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
             if user:
                 self.preferred_voice = user.get("voice")
         except Exception:
+            logger.exception("WS authentication failed")
             self.preferred_voice = None
 
     async def receive(self, text_data):
@@ -124,6 +126,7 @@ class ChatConsumer(AsyncWebsocketConsumer):
                     reply_text,
                     voice_id=requested_voice,
                 )
+                logger.info("Requested voice %s, used voice %s", requested_voice, used_voice)
 
                 if error:
                     raise Exception(f"TTS Error: {error}")
@@ -143,6 +146,35 @@ class ChatConsumer(AsyncWebsocketConsumer):
                         'confidence': reply.confidence
                     },
                     'context': reply.context
+                }))
+            elif message_type == 'generate':
+                text = text_data_json.get('text') or text_data_json.get('message', '')
+                requested_voice = text_data_json.get('voice') or self.preferred_voice
+                if not text:
+                    raise ValueError("No text provided for generation")
+
+                audio_data, error, used_voice, audio_format = await tts_service.text_to_speech(
+                    text,
+                    voice_id=requested_voice,
+                )
+
+                if error:
+                    raise Exception(f"TTS Error: {error}")
+
+                audio_b64 = base64.b64encode(audio_data).decode('utf-8')
+                await self.send(text_data=json.dumps({
+                    'type': 'tts_result',
+                    'message_id': message_id,
+                    'request_text': text,
+                    'audio': audio_b64,
+                    'text': text,
+                    'format': audio_format,
+                    'voice': used_voice,
+                    'match': {
+                        'prompt': 'generate',
+                        'confidence': 1.0,
+                    },
+                    'context': None,
                 }))
 
         except json.JSONDecodeError as e:
