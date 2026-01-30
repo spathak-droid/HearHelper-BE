@@ -24,6 +24,8 @@ from voice_common_names import VOICE_COMMON_NAMES
 
 logger = logging.getLogger(__name__)
 
+AUTH0_ENABLED = False
+
 ALLOWED_IMAGE_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
@@ -185,7 +187,7 @@ def signup(request):
         logger.warning(f"User {email} already exists in MongoDB")
         # If user exists in MongoDB but not in Auth0, we'll still allow the process to continue
         # This handles the case where Auth0 user creation previously failed
-        if auth0_mgmt.is_configured() and not auth0_mgmt.user_exists(email):
+        if AUTH0_ENABLED and auth0_mgmt.is_configured() and not auth0_mgmt.user_exists(email):
             logger.info(f"User {email} exists in MongoDB but not in Auth0, will attempt to create Auth0 user")
         else:
             return _json_error("An account with this email already exists.", status=409, errorCode="account_exists")
@@ -196,7 +198,7 @@ def signup(request):
     # If user exists in MongoDB but not in Auth0, try to get the auth0_id from the existing user
     if existing_user and 'auth0_id' in existing_user:
         auth0_id = existing_user['auth0_id']
-    if auth0_mgmt.is_configured():
+    if AUTH0_ENABLED and auth0_mgmt.is_configured():
         try:
             # First, try to get the user by email
             auth0_user = auth0_mgmt.get_user_by_email(email)
@@ -295,7 +297,7 @@ def signin(request):
         return _json_error("Invalid credentials.", status=401)
 
     auth0_id = user.get("auth0_id")
-    if auth0_mgmt.is_configured():
+    if AUTH0_ENABLED and auth0_mgmt.is_configured():
         if not auth0_id:
             auth0_record = None
             try:

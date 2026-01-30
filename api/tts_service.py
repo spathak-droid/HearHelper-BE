@@ -2,6 +2,7 @@
 import asyncio
 import logging
 import os
+import re
 import wave
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -13,7 +14,7 @@ from gtts import gTTS
 
 from storage import r2_client
 from .ssml import ssml_to_plain_text
-from .text_enricher import enrich_text_for_tts
+from .text_enricher import PAUSE_MARKER, enrich_text_for_tts
 
 try:
     from pydub import AudioSegment
@@ -111,6 +112,32 @@ class TTSService:
         self._gtts_format = "mp3"
         self.remote_models: set[str] = set()
         self.allow_ssml_passthrough = os.getenv("TTS_ALLOW_SSML", "").lower() in {"1", "true", "yes", "on"}
+        self.sentence_pause_markers = max(1, int(os.getenv("TTS_SENTENCE_PAUSE_MARKERS", "3")))
+        self.sentence_pause_ms = max(100, int(os.getenv("TTS_SENTENCE_PAUSE_MS", "500")))
+        self.comma_pause_ms = max(50, int(os.getenv("TTS_COMMA_PAUSE_MS", "250")))
+        self.semicolon_pause_ms = max(50, int(os.getenv("TTS_SEMICOLON_PAUSE_MS", "250")))
+        self.punctuation_pauses_enabled = os.getenv("TTS_PUNCTUATION_PAUSES", "true").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self._inline_break_pattern = re.compile(r"\[(?:break|pause|silence)\]", re.IGNORECASE)
+        self._abbrev_tokens = {
+            "mr",
+            "mrs",
+            "ms",
+            "dr",
+            "prof",
+            "sr",
+            "jr",
+            "st",
+            "mt",
+            "vs",
+            "etc",
+            "e.g",
+            "i.e",
+        }
 
         if self.piper_enabled:
             self._discover_models()
@@ -163,11 +190,19 @@ class TTSService:
                 )
             else:
                 try:
-                    audio_data = await loop.run_in_executor(
-                        None,
-                        model.synthesize,
-                        prepared_text,
-                    )
+                    if self.punctuation_pauses_enabled and isinstance(text, str):
+                        audio_data = await loop.run_in_executor(
+                            None,
+                            self._synthesize_with_piper_pauses,
+                            model,
+                            text,
+                        )
+                    else:
+                        audio_data = await loop.run_in_executor(
+                            None,
+                            model.synthesize,
+                            prepared_text,
+                        )
                     return await self._ensure_format(
                         audio_data,
                         source_format="wav",
@@ -196,6 +231,36 @@ class TTSService:
             metadata_voice=voice_id or self.default_voice_id,
         )
 
+    def _synthesize_with_piper_pauses(self, model: PiperVoiceModel, text: str) -> bytes:
+        segments = self._split_text_with_pauses(text)
+        if not segments:
+            return model.synthesize(text)
+
+        audio_chunks: list[bytes] = []
+        pauses_ms: list[int] = []
+        for segment_text, pause_ms in segments:
+            prepared = self._prepare_text_payload(segment_text, None, apply_sentence_pauses=False)
+            if not prepared:
+                continue
+            audio_chunks.append(model.synthesize(prepared))
+            pauses_ms.append(pause_ms)
+
+        if not audio_chunks:
+            return model.synthesize(text)
+
+        if AudioSegment is not None:
+            combined = AudioSegment.empty()
+            for audio_data, pause_ms in zip(audio_chunks, pauses_ms, strict=False):
+                chunk = AudioSegment.from_file(BytesIO(audio_data), format="wav")
+                combined += chunk
+                if pause_ms:
+                    combined += AudioSegment.silent(duration=pause_ms)
+            output = BytesIO()
+            combined.export(output, format="wav")
+            return output.getvalue()
+
+        return self._concat_wav_with_silence(audio_chunks, pauses_ms)
+
     def available_voices(self) -> Tuple[str, ...]:
         """Return the list of discovered voice ids."""
         if not self.piper_enabled and not self.remote_models:
@@ -212,6 +277,15 @@ class TTSService:
         metadata_voice: Optional[str],
     ) -> Tuple[Optional[bytes], Optional[str], Optional[str], str]:
         try:
+            if self.punctuation_pauses_enabled:
+                audio_data = await loop.run_in_executor(
+                    None,
+                    self._synthesize_with_gtts_pauses,
+                    text,
+                    preferred_format or self._gtts_format,
+                )
+                return audio_data, None, metadata_voice, self._determine_format(preferred_format)
+
             audio_data = await loop.run_in_executor(
                 None,
                 self._synthesize_with_gtts,
@@ -232,6 +306,30 @@ class TTSService:
         tts = gTTS(text=text, lang=self.gtts_lang)
         tts.write_to_fp(buffer)
         return buffer.getvalue()
+
+    def _synthesize_with_gtts_pauses(self, text: str, target_format: str) -> bytes:
+        if AudioSegment is None:
+            logger.warning("Programmatic pauses require pydub/ffmpeg for gTTS. Falling back.")
+            return self._synthesize_with_gtts(text)
+
+        segments = self._split_text_with_pauses(text)
+        if not segments:
+            return self._synthesize_with_gtts(text)
+
+        combined = AudioSegment.empty()
+        for segment_text, pause_ms in segments:
+            prepared = self._prepare_text_payload(segment_text, None, apply_sentence_pauses=False)
+            if not prepared:
+                continue
+            chunk_bytes = self._synthesize_with_gtts(prepared)
+            chunk = AudioSegment.from_file(BytesIO(chunk_bytes), format=self._gtts_format)
+            combined += chunk
+            if pause_ms:
+                combined += AudioSegment.silent(duration=pause_ms)
+
+        output = BytesIO()
+        combined.export(output, format=target_format)
+        return output.getvalue()
 
     async def _ensure_format(
         self,
@@ -303,7 +401,12 @@ class TTSService:
             return default_format
         return self._gtts_format
 
-    def _prepare_text_payload(self, raw_text: object, ssml_text: Optional[str]) -> Optional[str]:
+    def _prepare_text_payload(
+        self,
+        raw_text: object,
+        ssml_text: Optional[str],
+        apply_sentence_pauses: bool = True,
+    ) -> Optional[str]:
         """
         Decide which text should be fed into the synthesis engine.
 
@@ -313,19 +416,142 @@ class TTSService:
         base_text = raw_text.strip() if isinstance(raw_text, str) else ""
         ssml_candidate = ssml_text.strip() if isinstance(ssml_text, str) else None
 
+        if not ssml_candidate and base_text:
+            ssml_candidate = self._maybe_wrap_inline_ssml(base_text) if apply_sentence_pauses else None
+
         if ssml_candidate:
             if self.allow_ssml_passthrough:
                 return ssml_candidate
             downgrade = ssml_to_plain_text(ssml_candidate)
             if downgrade:
-                return downgrade
+                return self._normalize_text_breaks(downgrade)
             # Fall back to whatever plain text we have
 
         if not base_text:
             return None
 
-        enriched = enrich_text_for_tts(base_text)
-        return enriched or base_text
+        normalized = self._normalize_text_breaks(base_text, apply_sentence_pauses=apply_sentence_pauses)
+        enriched = enrich_text_for_tts(normalized)
+        return enriched or normalized
+
+    def _maybe_wrap_inline_ssml(self, text: str) -> Optional[str]:
+        if "<speak" in text or "<break" in text or "<p>" in text or "<s>" in text:
+            if "<speak" in text:
+                return text
+            return f"<speak>{text}</speak>"
+        return None
+
+    def _normalize_text_breaks(self, text: str, apply_sentence_pauses: bool = True) -> str:
+        cleaned = text.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = self._inline_break_pattern.sub(PAUSE_MARKER, cleaned)
+        cleaned = re.sub(r"\n{2,}", f"{PAUSE_MARKER}", cleaned)
+        if apply_sentence_pauses:
+            cleaned = cleaned
+        cleaned = cleaned.replace("\n", " ")
+        collapsed = " ".join(cleaned.split())
+        return collapsed
+
+    def _split_text_with_pauses(self, text: str) -> list[tuple[str, int]]:
+        if not text:
+            return []
+        matches = list(re.finditer(r"[.!?,;]", text))
+        if not matches:
+            return [(text.strip(), 0)] if text.strip() else []
+
+        segments: list[tuple[str, int]] = []
+        buffer: list[str] = []
+        last_idx = 0
+
+        for match in matches:
+            end = match.end()
+            buffer.append(text[last_idx:end])
+            pause_ms = self._pause_for_punctuation(text, match)
+            if pause_ms:
+                segment = "".join(buffer).strip()
+                if segment:
+                    segments.append((segment, pause_ms))
+                buffer = []
+            last_idx = end
+
+        buffer.append(text[last_idx:])
+        tail = "".join(buffer).strip()
+        if tail:
+            segments.append((tail, 0))
+        return segments
+
+    def _pause_for_punctuation(self, text: str, match: re.Match) -> int:
+        punct = match.group(0)
+        if punct == ",":
+            return self.comma_pause_ms
+        if punct == ";":
+            return self.semicolon_pause_ms
+        if punct in {"!", "?"}:
+            return self.sentence_pause_ms
+        if punct == ".":
+            if self._is_abbreviation_period(text, match):
+                return 0
+            return self.sentence_pause_ms
+        return 0
+
+    def _is_abbreviation_period(self, text: str, match: re.Match) -> bool:
+        start = match.start()
+        if start > 0 and text[start - 1].isdigit():
+            if match.end() < len(text) and text[match.end()].isdigit():
+                return True
+        prefix = text[:start]
+        token_match = re.search(r"([A-Za-z]{1,5})$", prefix)
+        if token_match:
+            token = token_match.group(1).lower()
+            if token in self._abbrev_tokens or len(token) == 1:
+                return True
+        return False
+
+    def _concat_wav_with_silence(self, chunks: list[bytes], pauses_ms: list[int]) -> bytes:
+        if not chunks:
+            return b""
+
+        params = None
+        wave_chunks: list[tuple[bytes, int, int, int]] = []
+        for chunk in chunks:
+            with wave.open(BytesIO(chunk), "rb") as reader:
+                chunk_params = reader.getparams()
+                if params is None:
+                    params = chunk_params
+                elif (
+                    params.nchannels != chunk_params.nchannels
+                    or params.sampwidth != chunk_params.sampwidth
+                    or params.framerate != chunk_params.framerate
+                ):
+                    raise RuntimeError("WAV chunks use different audio params; cannot concat without pydub.")
+                wave_chunks.append(
+                    (reader.readframes(reader.getnframes()), params.nchannels, params.sampwidth, params.framerate)
+                )
+
+        if params is None:
+            return b""
+
+        output = BytesIO()
+        with wave.open(output, "wb") as writer:
+            writer.setnchannels(params.nchannels)
+            writer.setsampwidth(params.sampwidth)
+            writer.setframerate(params.framerate)
+            for (frames, channels, sampwidth, framerate), pause_ms in zip(wave_chunks, pauses_ms, strict=False):
+                writer.writeframes(frames)
+                if pause_ms:
+                    silence_frames = int(framerate * (pause_ms / 1000))
+                    writer.writeframes(b"\x00" * silence_frames * channels * sampwidth)
+
+        return output.getvalue()
+
+    def _inject_period_pause(self, text: str, match: re.Match, pause: str) -> str:
+        prefix = text[: match.start()]
+        token_match = re.search(r"([A-Za-z]{1,5})$", prefix)
+        if token_match:
+            token = token_match.group(1).lower()
+            if token in self._abbrev_tokens or len(token) == 1:
+                return match.group(0)
+        spacer = " " if pause and not pause.endswith(" ") else ""
+        return f".{spacer}{pause}{match.group(1)}"
 
     def _discover_models(self) -> None:
         discovered: Dict[str, PiperVoiceModel] = {}

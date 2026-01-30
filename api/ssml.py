@@ -205,6 +205,8 @@ def _marker_for_break(node: ET.Element, default_marker: str) -> str:
     if duration_ms is None:
         return default_marker
 
+    if duration_ms >= 2500:
+        return f"{default_marker.strip()} {default_marker.strip()} {default_marker.strip()} "
     if duration_ms >= 1300:
         return f"{default_marker.strip()} {default_marker.strip()} "
     if duration_ms >= 800:
